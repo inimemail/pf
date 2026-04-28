@@ -1,4 +1,3 @@
-cat > /root/pf.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -636,6 +635,3 @@ make_service
 apply_rules
 menu
 EOF
-
-chmod +x /root/pf.sh
-bash /root/pf.sh
