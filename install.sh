@@ -5,9 +5,9 @@ BASE_DIR="/etc/pure-port-forward"
 RULE_FILE="$BASE_DIR/rules.db"
 APPLY_SCRIPT="$BASE_DIR/apply.sh"
 SERVICE_FILE="/etc/systemd/system/pure-port-forward.service"
+NFT_CONF="$BASE_DIR/rules.nft"
 
-CHAIN_PRE="PPF_PREROUTING"
-CHAIN_POST="PPF_POSTROUTING"
+NFT_TABLE="ppf_nat"
 
 GREEN="\033[0;32m"
 RED="\033[0;31m"
@@ -49,7 +49,7 @@ detect_pkg_manager() {
 install_deps() {
   local missing=()
 
-  for cmd in iptables sysctl systemctl getent ss awk sed grep; do
+  for cmd in nft sysctl systemctl getent ss awk sed grep jq; do
     if ! has_cmd "$cmd"; then
       missing+=("$cmd")
     fi
@@ -68,24 +68,26 @@ install_deps() {
     apt)
       echo -e "${CYAN}正在自动安装依赖...${NC}"
       apt-get update -y
-      apt-get install -y iptables iproute2 procps systemd
+      apt-get install -y nftables iproute2 procps systemd jq
       ;;
     dnf)
       echo -e "${CYAN}正在自动安装依赖...${NC}"
-      dnf install -y iptables iproute procps-ng systemd
+      dnf install -y nftables iproute procps-ng systemd jq
       ;;
     yum)
       echo -e "${CYAN}正在自动安装依赖...${NC}"
-      yum install -y iptables iproute procps-ng systemd
+      yum install -y nftables iproute procps-ng systemd jq
       ;;
     *)
-      echo -e "${RED}无法识别包管理器，请手动安装：iptables iproute2/procps/systemd${NC}"
+      echo -e "${RED}无法识别包管理器，请手动安装：nftables iproute2/procps/systemd jq${NC}"
       exit 1
       ;;
   esac
 
+  systemctl enable --now nftables >/dev/null 2>&1 || true
+
   local still_missing=0
-  for cmd in iptables sysctl systemctl getent ss awk sed grep; do
+  for cmd in nft sysctl systemctl getent ss awk sed grep jq; do
     if ! has_cmd "$cmd"; then
       echo -e "${RED}仍然缺少命令：$cmd${NC}"
       still_missing=1
@@ -187,17 +189,26 @@ print_rules() {
 
 parse_json_line() {
   local raw="$1"
-  local name listen_port dest
+  local name listen_port dest dest_type
 
-  name="$(echo "$raw" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-  listen_port="$(echo "$raw" | sed -n 's/.*"listen_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
-  dest="$(echo "$raw" | sed -n 's/.*"dest"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if ! echo "$raw" | jq -e . >/dev/null 2>&1; then
+    return 1
+  fi
 
-  if [[ -z "$dest" ]]; then
-    dest="$(echo "$raw" | sed -n 's/.*"dest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  name="$(echo "$raw" | jq -r '.name // empty')"
+  listen_port="$(echo "$raw" | jq -r '.listen_port // empty')"
+
+  dest_type="$(echo "$raw" | jq -r '.dest | type')"
+  if [[ "$dest_type" == "array" ]]; then
+    dest="$(echo "$raw" | jq -r '.dest[0] // empty')"
+  elif [[ "$dest_type" == "string" ]]; then
+    dest="$(echo "$raw" | jq -r '.dest // empty')"
+  else
+    dest=""
   fi
 
   [[ -n "$name" && -n "$listen_port" && -n "$dest" ]] || return 1
+  
   echo "$name|$listen_port|$dest"
 }
 
@@ -207,8 +218,8 @@ make_apply_script() {
 set -euo pipefail
 
 RULE_FILE="$RULE_FILE"
-CHAIN_PRE="$CHAIN_PRE"
-CHAIN_POST="$CHAIN_POST"
+NFT_CONF="$NFT_CONF"
+NFT_TABLE="$NFT_TABLE"
 
 resolve_ipv4() {
   getent ahostsv4 "\$1" | awk '{print \$1; exit}'
@@ -216,37 +227,35 @@ resolve_ipv4() {
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
-iptables -t nat -N "\$CHAIN_PRE" 2>/dev/null || true
-iptables -t nat -N "\$CHAIN_POST" 2>/dev/null || true
+echo "add table ip \$NFT_TABLE" > "\$NFT_CONF"
+echo "flush table ip \$NFT_TABLE" >> "\$NFT_CONF"
+echo "add chain ip \$NFT_TABLE prerouting { type nat hook prerouting priority dstnat; policy accept; }" >> "\$NFT_CONF"
+echo "add chain ip \$NFT_TABLE postrouting { type nat hook postrouting priority srcnat; policy accept; }" >> "\$NFT_CONF"
 
-iptables -t nat -F "\$CHAIN_PRE" 2>/dev/null || true
-iptables -t nat -F "\$CHAIN_POST" 2>/dev/null || true
+if [[ -s "\$RULE_FILE" ]]; then
+  while IFS='|' read -r name listen_port dest; do
+    [[ -z "\${listen_port:-}" || -z "\${dest:-}" ]] && continue
 
-iptables -t nat -C PREROUTING -j "\$CHAIN_PRE" 2>/dev/null || iptables -t nat -A PREROUTING -j "\$CHAIN_PRE"
-iptables -t nat -C POSTROUTING -j "\$CHAIN_POST" 2>/dev/null || iptables -t nat -A POSTROUTING -j "\$CHAIN_POST"
+    host="\${dest%:*}"
+    dport="\${dest##*:}"
+    ip="\$(resolve_ipv4 "\$host" || true)"
 
-[[ -s "\$RULE_FILE" ]] || exit 0
+    if [[ -z "\$ip" ]]; then
+      echo "跳过：\$name -> \$dest，解析失败"
+      continue
+    fi
 
-while IFS='|' read -r name listen_port dest; do
-  [[ -z "\${listen_port:-}" || -z "\${dest:-}" ]] && continue
+    echo "add rule ip \$NFT_TABLE prerouting tcp dport \$listen_port dnat to \$ip:\$dport" >> "\$NFT_CONF"
+    echo "add rule ip \$NFT_TABLE prerouting udp dport \$listen_port dnat to \$ip:\$dport" >> "\$NFT_CONF"
+    
+    echo "add rule ip \$NFT_TABLE postrouting ip daddr \$ip tcp dport \$dport masquerade" >> "\$NFT_CONF"
+    echo "add rule ip \$NFT_TABLE postrouting ip daddr \$ip udp dport \$dport masquerade" >> "\$NFT_CONF"
 
-  host="\${dest%:*}"
-  dport="\${dest##*:}"
-  ip="\$(resolve_ipv4 "\$host" || true)"
+    echo "已构建规则：\$name  0.0.0.0:\$listen_port -> \$ip:\$dport"
+  done < "\$RULE_FILE"
+fi
 
-  if [[ -z "\$ip" ]]; then
-    echo "跳过：\$name -> \$dest，解析失败"
-    continue
-  fi
-
-  iptables -t nat -A "\$CHAIN_PRE" -p tcp --dport "\$listen_port" -j DNAT --to-destination "\$ip:\$dport"
-  iptables -t nat -A "\$CHAIN_PRE" -p udp --dport "\$listen_port" -j DNAT --to-destination "\$ip:\$dport"
-
-  iptables -t nat -A "\$CHAIN_POST" -p tcp -d "\$ip" --dport "\$dport" -j MASQUERADE
-  iptables -t nat -A "\$CHAIN_POST" -p udp -d "\$ip" --dport "\$dport" -j MASQUERADE
-
-  echo "已加载：\$name  0.0.0.0:\$listen_port -> \$ip:\$dport"
-done < "\$RULE_FILE"
+nft -f "\$NFT_CONF"
 EOF2
 
   chmod +x "$APPLY_SCRIPT"
@@ -255,8 +264,8 @@ EOF2
 make_service() {
   cat > "$SERVICE_FILE" <<EOF2
 [Unit]
-Description=Pure Port Forward
-After=network-online.target
+Description=Pure Port Forward (nftables backend)
+After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
@@ -325,9 +334,10 @@ import_many() {
   clear
   echo -e "${CYAN}快捷导入多条${NC}"
   echo
+  # 【深度修改】使用标准的 RFC 测试地址，彻底阻断您的真实数据泄露风险
   echo "支持一行一个："
-  echo '{"dest":["uoutw.bambs.cc:46379"],"listen_port":22086,"name":"测试"}'
-  echo '{"dest":["23.249.27.101:38765"],"listen_port":38765,"name":"阿里云代理"}'
+  echo '{"dest":["node1.example.com:46379"],"listen_port":22086,"name":"测试"}'
+  echo '{"dest":["198.51.100.1:38765"],"listen_port":38765,"name":"云端代理"}'
   echo
   echo -e "${YELLOW}粘贴完成后，单独输入 EOF 回车结束${NC}"
   echo
@@ -550,7 +560,8 @@ export_rules() {
 
   while IFS='|' read -r name listen_port dest; do
     [[ -z "${listen_port:-}" || -z "${dest:-}" ]] && continue
-    printf '{"dest":["%s"],"listen_port":%s,"name":"%s"}\n' "$dest" "$listen_port" "$name"
+    jq -n --arg name "$name" --arg port "$listen_port" --arg dest "$dest" \
+      '{dest: [$dest], listen_port: ($port|tonumber), name: $name}' -c
   done < "$RULE_FILE"
 }
 
@@ -564,14 +575,13 @@ status_info() {
   print_rules
 
   echo
-  echo -e "${CYAN}iptables NAT 规则：${NC}"
-  iptables -t nat -S "$CHAIN_PRE" 2>/dev/null || true
-  iptables -t nat -S "$CHAIN_POST" 2>/dev/null || true
+  echo -e "${CYAN}nftables 原生 NAT 规则 ($NFT_TABLE 表)：${NC}"
+  nft list table ip "$NFT_TABLE" 2>/dev/null || echo -e "${YELLOW}未检测到规则表${NC}"
 }
 
 uninstall_all() {
   clear
-  read -rp "确认卸载并删除所有规则？输入 YES 确认: " ok
+  read -rp "确认彻底卸载并删除所有配置？输入 YES 确认: " ok
 
   if [[ "$ok" != "YES" ]]; then
     echo -e "${YELLOW}已取消${NC}"
@@ -580,21 +590,14 @@ uninstall_all() {
 
   systemctl disable --now pure-port-forward >/dev/null 2>&1 || true
 
-  iptables -t nat -F "$CHAIN_PRE" 2>/dev/null || true
-  iptables -t nat -F "$CHAIN_POST" 2>/dev/null || true
-
-  iptables -t nat -D PREROUTING -j "$CHAIN_PRE" 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -j "$CHAIN_POST" 2>/dev/null || true
-
-  iptables -t nat -X "$CHAIN_PRE" 2>/dev/null || true
-  iptables -t nat -X "$CHAIN_POST" 2>/dev/null || true
+  nft delete table ip "$NFT_TABLE" 2>/dev/null || true
 
   rm -f "$SERVICE_FILE"
   rm -rf "$BASE_DIR"
 
   systemctl daemon-reload
 
-  echo -e "${GREEN}卸载完成${NC}"
+  echo -e "${GREEN}卸载完成，系统环境已洁净如初。${NC}"
 }
 
 menu() {
@@ -618,7 +621,7 @@ menu() {
       2) add_one; pause ;;
       3) import_many; pause ;;
       4) delete_menu ;;
-      5) apply_rules; echo -e "${GREEN}已重新应用规则${NC}"; pause ;;
+      5) apply_rules; echo -e "${GREEN}已重新应用原子级规则${NC}"; pause ;;
       6) export_rules; pause ;;
       7) status_info; pause ;;
       8) uninstall_all; pause ;;
@@ -634,4 +637,3 @@ make_apply_script
 make_service
 apply_rules
 menu
-EOF
